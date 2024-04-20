@@ -178,7 +178,9 @@ class SparseAutoencoder(HookedRootModule):
             )
 
         mse_loss = per_item_mse_loss.mean()
-        sparsity = feature_acts.norm(p=self.lp_norm, dim=1).mean(dim=(0,))
+        sparsity = _per_item_sparsity_loss_with_target_norm(
+            feature_acts, x, self.lp_norm, self.cfg.l1_loss_normalization
+        ).mean(dim=(0,))
         l1_loss = self.l1_coefficient * sparsity
         loss = mse_loss + l1_loss + ghost_grad_loss
 
@@ -415,3 +417,20 @@ def _per_item_mse_loss_with_target_norm(
         )
     else:
         return torch.nn.functional.mse_loss(preds, target, reduction="none")
+
+
+def _per_item_sparsity_loss_with_target_norm(
+    feature_acts: torch.Tensor,
+    target: torch.Tensor,
+    lp_norm: float,
+    l1_loss_normalization: Optional[str] = None,
+) -> torch.Tensor:
+    """
+    Calculate L1 loss per item in the batch, without taking a mean.
+    Then, normalizes by the square L2 norm of the ORIGINAL target.
+    """
+    if l1_loss_normalization == "l2_squared":
+        normalization = target.norm(dim=-1, p=2).pow(2)
+        return feature_acts.norm(p=lp_norm, dim=-1) * normalization
+    else:
+        return feature_acts.norm(p=lp_norm, dim=-1)
