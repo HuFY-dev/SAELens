@@ -3,15 +3,19 @@ https://github.com/ArthurConmy/sae/blob/main/sae/model.py
 """
 
 import gzip
+import json
 import os
 import pickle
-from typing import NamedTuple
+from typing import Callable, NamedTuple, Optional
 
 import einops
 import torch
+from safetensors import safe_open
+from safetensors.torch import save_file
 from torch import nn
 from transformer_lens.hook_points import HookedRootModule, HookPoint
 
+from sae_lens.training.activation_functions import get_activation_fn
 from sae_lens.training.config import LanguageModelSAERunnerConfig
 from sae_lens.training.utils import BackwardsCompatiblePickleClass
 
@@ -32,9 +36,12 @@ class SparseAutoencoder(HookedRootModule):
     lp_norm: float
     d_sae: int
     use_ghost_grads: bool
+    normalize_sae_decoder: bool
     hook_point_layer: int
     dtype: torch.dtype
     device: str | torch.device
+    noise_scale: float
+    activation_fn: Callable[[torch.Tensor], torch.Tensor]
 
     def __init__(
         self,
@@ -66,7 +73,10 @@ class SparseAutoencoder(HookedRootModule):
         self.dtype = cfg.dtype
         self.device = cfg.device
         self.use_ghost_grads = cfg.use_ghost_grads
+        self.normalize_sae_decoder = cfg.normalize_sae_decoder
         self.hook_point_layer = cfg.hook_point_layer
+        self.noise_scale = cfg.noise_scale
+        self.activation_fn = get_activation_fn(cfg.activation_fn)
 
         # NOTE: if using resampling neurons method, you must ensure that we initialise the weights in the order W_enc, b_enc, W_dec, b_dec
         self.W_enc = nn.Parameter(
@@ -84,12 +94,21 @@ class SparseAutoencoder(HookedRootModule):
             )
         )
 
-        with torch.no_grad():
-            # Anthropic normalize this to have unit columns
-            self.set_decoder_norm_to_unit_norm()
+        if self.cfg.decoder_orthogonal_init:
+            self.W_dec.data = nn.init.orthogonal_(self.W_dec.data.T).T
+
+        if self.normalize_sae_decoder:
+            with torch.no_grad():
+                # Anthropic normalize this to have unit columns
+                self.set_decoder_norm_to_unit_norm()
 
         self.b_dec = nn.Parameter(
             torch.zeros(self.d_in, dtype=self.dtype, device=self.device)
+        )
+
+        # scaling factor for fine-tuning (not to be used in initial training)
+        self.scaling_factor = nn.Parameter(
+            torch.ones(self.d_sae, dtype=self.dtype, device=self.device)
         )
 
         self.hook_sae_in = HookPoint()
@@ -103,7 +122,7 @@ class SparseAutoencoder(HookedRootModule):
         # move x to correct dtype
         x = x.to(self.dtype)
         sae_in = self.hook_sae_in(
-            x - self.b_dec
+            x - (self.b_dec * self.cfg.apply_b_dec_to_input)
         )  # Remove decoder bias as per Anthropic
 
         hidden_pre = self.hook_hidden_pre(
@@ -114,11 +133,16 @@ class SparseAutoencoder(HookedRootModule):
             )
             + self.b_enc
         )
-        feature_acts = self.hook_hidden_post(torch.nn.functional.relu(hidden_pre))
+        noisy_hidden_pre = hidden_pre
+        if self.noise_scale > 0:
+            noise = torch.randn_like(hidden_pre) * self.noise_scale
+            noisy_hidden_pre = hidden_pre + noise
+        feature_acts = self.hook_hidden_post(self.activation_fn(noisy_hidden_pre))
 
         sae_out = self.hook_sae_out(
             einops.einsum(
-                feature_acts,
+                feature_acts
+                * self.scaling_factor,  # need to make sure this handled when loading old models.
                 self.W_dec,
                 "... d_sae, d_sae d_in -> ... d_in",
             )
@@ -126,7 +150,9 @@ class SparseAutoencoder(HookedRootModule):
         )
 
         # add config for whether l2 is normalized:
-        per_item_mse_loss = _per_item_mse_loss_with_target_norm(sae_out, x)
+        per_item_mse_loss = _per_item_mse_loss_with_target_norm(
+            sae_out, x, self.cfg.mse_loss_normalization
+        )
         ghost_grad_loss = torch.tensor(0.0, dtype=self.dtype, device=self.device)
         # gate on config and training so evals is not slowed down.
         if (
@@ -201,7 +227,7 @@ class SparseAutoencoder(HookedRootModule):
             "d_sae, d_sae d_in -> d_sae d_in",
         )
 
-    def save_model(self, path: str):
+    def save_model_legacy(self, path: str):
         """
         Basic save function for the model. Saves the model's state_dict and the config used to train it.
         """
@@ -214,12 +240,6 @@ class SparseAutoencoder(HookedRootModule):
 
         if path.endswith(".pt"):
             torch.save(state_dict, path)
-        elif path.endswith(".pkl"):
-            with open(path, "wb") as f:
-                pickle.dump(state_dict, f)
-        elif path.endswith("pkl.gz"):
-            with gzip.open(path, "wb") as f:
-                pickle.dump(state_dict, f)
         else:
             raise ValueError(
                 f"Unexpected file extension: {path}, supported extensions are .pt and .pkl.gz"
@@ -227,8 +247,31 @@ class SparseAutoencoder(HookedRootModule):
 
         print(f"Saved model to {path}")
 
+    def save_model(self, path: str, sparsity: Optional[torch.Tensor] = None):
+
+        if not os.path.exists(path):
+            os.mkdir(path)
+
+        # generate the weights
+        save_file(self.state_dict(), f"{path}/sae_weights.safetensors")
+
+        # save the config
+        config = {
+            **self.cfg.__dict__,
+            # some args may not be serializable by default
+            "dtype": str(self.cfg.dtype),
+            "device": str(self.cfg.device),
+        }
+
+        with open(f"{path}/cfg.json", "w") as f:
+            json.dump(config, f)
+
+        if sparsity is not None:
+            sparsity_in_dict = {"sparsity": sparsity}
+            save_file(sparsity_in_dict, f"{path}/sparsity.safetensors")  # type: ignore
+
     @classmethod
-    def load_from_pretrained(cls, path: str):
+    def load_from_pretrained_legacy(cls, path: str):
         """
         Load function for the model. Loads the model's state_dict and the config used to train it.
         This method can be called directly on the class, without needing an instance.
@@ -284,6 +327,39 @@ class SparseAutoencoder(HookedRootModule):
 
         return instance
 
+    @classmethod
+    def load_from_pretrained(cls, path: str, device: str = "cpu"):
+
+        config_path = os.path.join(path, "cfg.json")
+        weight_path = os.path.join(path, "sae_weights.safetensors")
+
+        with open(config_path, "r") as f:
+            config = json.load(f)
+
+        var_names = LanguageModelSAERunnerConfig.__init__.__code__.co_varnames
+        # filter config for varnames
+        config = {k: v for k, v in config.items() if k in var_names}
+        config["verbose"] = False
+        config["device"] = device
+        config = LanguageModelSAERunnerConfig(**config)
+        sae = SparseAutoencoder(config)
+
+        tensors = {}
+        with safe_open(weight_path, framework="pt", device=device) as f:  # type: ignore
+            for k in f.keys():
+                tensors[k] = f.get_tensor(k)
+
+        # old saves may not have scaling factors.
+        if "scaling_factor" not in tensors:
+            assert isinstance(config.d_sae, int)
+            tensors["scaling_factor"] = torch.ones(
+                config.d_sae, dtype=config.dtype, device=config.device
+            )
+
+        sae.load_state_dict(tensors)
+
+        return sae
+
     def get_name(self):
         sae_name = f"sparse_autoencoder_{self.cfg.model_name}_{self.cfg.hook_point}_{self.cfg.d_sae}"
         return sae_name
@@ -309,7 +385,7 @@ class SparseAutoencoder(HookedRootModule):
 
         # 3.
         per_item_mse_loss_ghost_resid = _per_item_mse_loss_with_target_norm(
-            ghost_out, residual.detach()
+            ghost_out, residual.detach(), self.cfg.mse_loss_normalization
         )
         mse_rescaling_factor = (
             per_item_mse_loss / (per_item_mse_loss_ghost_resid + 1e-6)
@@ -322,13 +398,20 @@ class SparseAutoencoder(HookedRootModule):
 
 
 def _per_item_mse_loss_with_target_norm(
-    preds: torch.Tensor, target: torch.Tensor
+    preds: torch.Tensor,
+    target: torch.Tensor,
+    mse_loss_normalization: Optional[str] = None,
 ) -> torch.Tensor:
     """
     Calculate MSE loss per item in the batch, without taking a mean.
     Then, normalizes by the L2 norm of the centered target.
     This normalization seems to improve performance.
     """
-    target_centered = target - target.mean(dim=0, keepdim=True)
-    normalization = target_centered.norm(dim=-1, keepdim=True)
-    return torch.nn.functional.mse_loss(preds, target, reduction="none") / normalization
+    if mse_loss_normalization == "dense_batch":
+        target_centered = target - target.mean(dim=0, keepdim=True)
+        normalization = target_centered.norm(dim=-1, keepdim=True)
+        return torch.nn.functional.mse_loss(preds, target, reduction="none") / (
+            normalization + 1e-6
+        )
+    else:
+        return torch.nn.functional.mse_loss(preds, target, reduction="none")

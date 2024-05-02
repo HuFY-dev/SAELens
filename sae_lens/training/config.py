@@ -1,9 +1,15 @@
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Optional, cast
 
 import torch
-
 import wandb
+
+DTYPE_MAP = {
+    "torch.float32": torch.float32,
+    "torch.float64": torch.float64,
+    "torch.float16": torch.float16,
+    "torch.bfloat16": torch.bfloat16,
+}
 
 
 @dataclass
@@ -14,7 +20,9 @@ class LanguageModelSAERunnerConfig:
 
     # Data Generating Function (Model + Training Distibuion)
     model_name: str = "gelu-2l"
+    model_class_name: str = "HookedTransformer"
     hook_point: str = "blocks.{layer}.hook_mlp_out"
+    hook_point_eval: str = "blocks.{layer}.attn.pattern"
     hook_point_layer: int | list[int] = 0
     hook_point_head_index: Optional[int] = None
     dataset_path: str = "NeelNanda/c4-tokenized-2b"
@@ -27,28 +35,44 @@ class LanguageModelSAERunnerConfig:
 
     # SAE Parameters
     d_in: int = 512
+    d_sae: Optional[int] = None
+    b_dec_init_method: str = "geometric_median"
+    expansion_factor: int | list[int] = 4
+    activation_fn: str = "relu"  # relu, tanh-relu
+    normalize_sae_decoder: bool = True
+    noise_scale: float = 0.0
+    from_pretrained_path: Optional[str] = None
+    apply_b_dec_to_input: bool = True
+    decoder_orthogonal_init: bool = False
 
     # Activation Store Parameters
     n_batches_in_buffer: int = 20
-    total_training_tokens: int = 2_000_000
+    training_tokens: int = 2_000_000
+    finetuning_tokens: int = 0
     store_batch_size: int = 32
     train_batch_size: int = 4096
 
     # Misc
     device: str | torch.device = "cpu"
     seed: int = 42
-    dtype: torch.dtype = torch.float32
+    dtype: str | torch.dtype = "float32"  # type: ignore #
     prepend_bos: bool = True
 
-    # SAE Parameters
-    b_dec_init_method: str = "geometric_median"
-    expansion_factor: int | list[int] = 4
-    from_pretrained_path: Optional[str] = None
-    d_sae: Optional[int] = None
-
     # Training Parameters
+
+    ## Batch size
+    train_batch_size: int = 4096
+
+    ## Adam
+    adam_beta1: float | list[float] = 0
+    adam_beta2: float | list[float] = 0.999
+
+    ## Loss Function
+    mse_loss_normalization: Optional[str] = None
     l1_coefficient: float | list[float] = 1e-3
     lp_norm: float | list[float] = 1
+
+    ## Learning Rate Schedule
     lr: float | list[float] = 3e-4
     lr_scheduler_name: str | list[str] = (
         "constant"  # constant, cosineannealing, cosineannealingwarmrestarts
@@ -59,7 +83,9 @@ class LanguageModelSAERunnerConfig:
     )
     lr_decay_steps: int | list[int] = 0
     n_restart_cycles: int | list[int] = 1  # used only for cosineannealingwarmrestarts
-    train_batch_size: int = 4096
+
+    ## FineTuning
+    finetuning_method: Optional[str] = None  # scale, decoder or unrotated_decoder
 
     # Resampling protocol args
     use_ghost_grads: bool | list[bool] = (
@@ -81,6 +107,7 @@ class LanguageModelSAERunnerConfig:
     n_checkpoints: int = 0
     checkpoint_path: str = "checkpoints"
     verbose: bool = True
+    model_kwargs: dict[str, Any] = field(default_factory=dict)
 
     def __post_init__(self):
         if self.use_cached_activations and self.cached_activations_path is None:
@@ -98,7 +125,7 @@ class LanguageModelSAERunnerConfig:
         )
 
         if self.run_name is None:
-            self.run_name = f"{self.d_sae}-L1-{self.l1_coefficient}-LR-{self.lr}-Tokens-{self.total_training_tokens:3.3e}"
+            self.run_name = f"{self.d_sae}-L1-{self.l1_coefficient}-LR-{self.lr}-Tokens-{self.training_tokens:3.3e}"
 
         if self.b_dec_init_method not in ["geometric_median", "mean", "zeros"]:
             raise ValueError(
@@ -107,6 +134,19 @@ class LanguageModelSAERunnerConfig:
         if self.b_dec_init_method == "zeros":
             print(
                 "Warning: We are initializing b_dec to zeros. This is probably not what you want."
+            )
+
+        if isinstance(self.dtype, str) and self.dtype not in DTYPE_MAP:
+            raise ValueError(
+                f"dtype must be one of {list(DTYPE_MAP.keys())}. Got {self.dtype}"
+            )
+        elif isinstance(self.dtype, str):
+            self.dtype: torch.dtype = DTYPE_MAP[self.dtype]
+
+        # if we use decoder fine tuning, we can't be applying b_dec to the input
+        if (self.finetuning_method == "decoder") and (self.apply_b_dec_to_input):
+            raise ValueError(
+                "If we are fine tuning the decoder, we can't be applying b_dec to the input.\nSet apply_b_dec_to_input to False."
             )
 
         self.device: str | torch.device = torch.device(self.device)
@@ -124,7 +164,7 @@ class LanguageModelSAERunnerConfig:
 
         if self.verbose:
             print(
-                f"Run name: {self.d_sae}-L1-{self.l1_coefficient}-LR-{self.lr}-Tokens-{self.total_training_tokens:3.3e}"
+                f"Run name: {self.d_sae}-L1-{self.l1_coefficient}-LR-{self.lr}-Tokens-{self.training_tokens:3.3e}"
             )
             # Print out some useful info:
             n_tokens_per_buffer = (
@@ -136,7 +176,9 @@ class LanguageModelSAERunnerConfig:
                 f"Lower bound: n_contexts_per_buffer (millions): {n_contexts_per_buffer / 10 **6}"
             )
 
-            total_training_steps = self.total_training_tokens // self.train_batch_size
+            total_training_steps = (
+                self.training_tokens + self.finetuning_tokens
+            ) // self.train_batch_size
             print(f"Total training steps: {total_training_steps}")
 
             total_wandb_updates = total_training_steps // self.wandb_log_frequency
@@ -173,6 +215,7 @@ class CacheActivationsRunnerConfig:
 
     # Data Generating Function (Model + Training Distibuion)
     model_name: str = "gelu-2l"
+    model_class_name: str = "HookedTransformer"
     hook_point: str = "blocks.{layer}.hook_mlp_out"
     hook_point_layer: int | list[int] = 0
     hook_point_head_index: Optional[int] = None
@@ -188,14 +231,14 @@ class CacheActivationsRunnerConfig:
 
     # Activation Store Parameters
     n_batches_in_buffer: int = 20
-    total_training_tokens: int = 2_000_000
+    training_tokens: int = 2_000_000
     store_batch_size: int = 32
     train_batch_size: int = 4096
 
     # Misc
     device: str | torch.device = "cpu"
     seed: int = 42
-    dtype: torch.dtype = torch.float32
+    dtype: str | torch.dtype = "float32"
     prepend_bos: bool = True
 
     # Activation caching stuff
@@ -203,6 +246,7 @@ class CacheActivationsRunnerConfig:
     n_shuffles_with_last_section: int = 10
     n_shuffles_in_entire_dir: int = 10
     n_shuffles_final: int = 100
+    model_kwargs: dict[str, Any] = field(default_factory=dict)
 
     def __post_init__(self):
         # Autofill cached_activations_path unless the user overrode it
