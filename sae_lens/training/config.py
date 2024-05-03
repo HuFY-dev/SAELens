@@ -53,6 +53,7 @@ class LanguageModelSAERunnerConfig:
     finetuning_tokens: int = 0
     store_batch_size: int = 32
     train_batch_size: int = 4096
+    collect_source_model_loss: bool = False
 
     # Misc
     device: str | torch.device = "cpu"
@@ -73,6 +74,7 @@ class LanguageModelSAERunnerConfig:
     mse_loss_normalization: Optional[str] = None
     l1_coefficient: float | list[float] = 1e-3
     lp_norm: float | list[float] = 1
+    normalize_loss_with_source_model_loss: bool = False
 
     ## Learning Rate Schedule
     lr: float | list[float] = 3e-4
@@ -250,6 +252,7 @@ class CacheActivationsRunnerConfig:
     n_shuffles_with_last_section: int = 10
     n_shuffles_in_entire_dir: int = 10
     n_shuffles_final: int = 100
+    collect_source_model_loss: bool = False
     model_kwargs: dict[str, Any] = field(default_factory=dict)
 
     def __post_init__(self):

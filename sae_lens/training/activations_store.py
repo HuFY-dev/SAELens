@@ -66,6 +66,7 @@ class ActivationsStore:
             device=cfg.device,
             dtype=cfg.dtype,
             cached_activations_path=cached_activations_path,
+            collect_source_model_loss=cfg.collect_source_model_loss,
             model_kwargs=cfg.model_kwargs,
         )
 
@@ -86,9 +87,12 @@ class ActivationsStore:
         device: str | torch.device,
         dtype: str | torch.dtype,
         cached_activations_path: str | None = None,
+        collect_source_model_loss: bool = False,
         model_kwargs: dict[str, Any] | None = None,
     ):
         self.model = model
+        # We don't train the source model, so we can set it to eval mode to save memory
+        self.model.eval()
         if model_kwargs is None:
             model_kwargs = {}
         self.model_kwargs = model_kwargs
@@ -110,6 +114,7 @@ class ActivationsStore:
         self.device = device
         self.dtype = dtype
         self.cached_activations_path = cached_activations_path
+        self.collect_source_model_loss = collect_source_model_loss
 
         self.iterable_dataset = iter(self.dataset)
 
@@ -239,22 +244,33 @@ class ActivationsStore:
             # pbar.refresh()
         return batch_tokens[:batch_size]
 
-    def get_activations(self, batch_tokens: torch.Tensor):
+    def get_activations(self, batch_tokens: torch.Tensor, stack_loss: bool):
         """
         Returns activations of shape (batches, context, num_layers, d_in)
 
         d_in may result from a concatenated head dimension.
+
+        If stack_loss is True, the loss is appended to the activations in the last dimension.
+        You can access the loss in stacked_activations by slicing the last dimension.
+        e.g. stacked_activations[..., -1] will give you the loss.
         """
         layers = self.hook_point_layers
         act_names = [self.hook_point.format(layer=layer) for layer in layers]
         hook_point_max_layer = max(layers)
-        layerwise_activations = self.model.run_with_cache(
+        stop_at_layer = None if stack_loss else hook_point_max_layer + 1
+        # Get activations and loss.
+        # If not stack_loss, we will stop early at layer <stop_at_layer>.
+        # If stop_at_layer is not None, the residual will be returned instead of the loss.
+        # We will not use the residual.
+        loss, layerwise_activations = self.model.run_with_cache(
             batch_tokens,
             names_filter=act_names,
-            stop_at_layer=hook_point_max_layer + 1,
+            stop_at_layer=stop_at_layer,
             prepend_bos=self.prepend_bos,
+            return_type="loss",
+            loss_per_token=True,
             **self.model_kwargs,
-        )[1]
+        )
         activations_list = [layerwise_activations[act_name] for act_name in act_names]
         if self.hook_point_head_index is not None:
             activations_list = [
@@ -269,6 +285,18 @@ class ActivationsStore:
         # Stack along a new dimension to keep separate layers distinct
         stacked_activations = torch.stack(activations_list, dim=2)
 
+        if stack_loss:
+            # Detach the loss to save memory
+            loss = loss.detach()
+            # Match the dim of the loss to the activations
+            loss = loss.unsqueeze(-1).unsqueeze(-1) 
+            # remove the last token from activations
+            stacked_activations = stacked_activations[:, :-1]
+            # append the loss to the activations at dim=-1
+            stacked_activations = torch.cat([stacked_activations, loss], dim=-1)
+        else:
+            del loss
+
         return stacked_activations
 
     def get_buffer(self, n_batches_in_buffer: int) -> torch.Tensor:
@@ -277,6 +305,11 @@ class ActivationsStore:
         d_in = self.d_in
         total_size = batch_size * n_batches_in_buffer
         num_layers = len(self.hook_point_layers)  # Number of hook points or layers
+        if self.collect_source_model_loss:
+            # The loss is appended to the activations in the last dimension
+            d_in += 1
+            # The last token does not have a loss, and thus is deleted
+            context_size -= 1
 
         if self.cached_activations_path is not None:
             # Load the activations from disk
@@ -341,7 +374,9 @@ class ActivationsStore:
 
         for refill_batch_idx_start in refill_iterator:
             refill_batch_tokens = self.get_batch_tokens()
-            refill_activations = self.get_activations(refill_batch_tokens)
+            refill_activations = self.get_activations(
+                refill_batch_tokens, self.collect_source_model_loss
+            )
             new_buffer[
                 refill_batch_idx_start : refill_batch_idx_start + batch_size, ...
             ] = refill_activations

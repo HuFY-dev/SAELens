@@ -71,6 +71,10 @@ class SparseAutoencoder(HookedRootModule):
         assert (
             "{layer}" not in cfg.hook_point
         ), "{layer} must be replaced with the actual layer number in SAE cfg"
+        assert (
+            not cfg.normalize_loss_with_source_model_loss
+            or cfg.collect_source_model_loss
+        ), "If normalizing loss with source model loss, you must collect the source model loss"
 
         self.d_sae = cfg.d_sae
         self.l1_coefficient = cfg.l1_coefficient
@@ -82,6 +86,9 @@ class SparseAutoencoder(HookedRootModule):
         self.hook_point_layer = cfg.hook_point_layer
         self.noise_scale = cfg.noise_scale
         self.activation_fn = get_activation_fn(cfg.activation_fn)
+        self.normalize_loss_with_source_model_loss = (
+            cfg.normalize_loss_with_source_model_loss
+        )
 
         # NOTE: if using resampling neurons method, you must ensure that we initialise the weights in the order W_enc, b_enc, W_dec, b_dec
         self.W_enc = nn.Parameter(
@@ -171,7 +178,15 @@ class SparseAutoencoder(HookedRootModule):
         return sae_out
 
     def forward(
-        self, x: torch.Tensor, dead_neuron_mask: torch.Tensor | None = None
+        self,
+        x: (
+            Float[torch.Tensor, "batch d_in"]
+            | Float[torch.Tensor, "batch context d_in"]
+        ),
+        dead_neuron_mask: torch.Tensor | None = None,
+        source_model_loss: (
+            Float[torch.Tensor, "batch"] | Float[torch.Tensor, "batch context"] | None
+        ) = None,
     ) -> ForwardOutput:
 
         feature_acts, hidden_pre = self._encode_with_hidden_pre(x)
@@ -197,8 +212,17 @@ class SparseAutoencoder(HookedRootModule):
                 dead_neuron_mask=dead_neuron_mask,
             )
 
-        mse_loss = per_item_mse_loss.mean()
-        sparsity = feature_acts.norm(p=self.lp_norm, dim=-1).mean()
+        mse_loss = per_item_mse_loss
+        sparsity = feature_acts.norm(p=self.lp_norm, dim=-1)
+        if (
+            self.normalize_loss_with_source_model_loss
+            and self.training
+        ):
+            assert source_model_loss is not None
+            mse_loss = normalize_with_source_model_loss(mse_loss, source_model_loss)
+            sparsity = normalize_with_source_model_loss(sparsity, source_model_loss)
+        mse_loss = mse_loss.mean()
+        sparsity = sparsity.mean()
         l1_loss = self.l1_coefficient * sparsity
         loss = mse_loss + l1_loss + ghost_grad_loss
 
@@ -213,7 +237,7 @@ class SparseAutoencoder(HookedRootModule):
 
     @torch.no_grad()
     def initialize_b_dec_with_precalculated(self, origin: torch.Tensor):
-        out = torch.tensor(origin, dtype=self.dtype, device=self.device)
+        out = origin.clone().to(self.dtype).to(self.device)
         self.b_dec.data = out
 
     @torch.no_grad()
@@ -481,3 +505,17 @@ def _per_item_mse_loss_with_target_norm(
         )
     else:
         return torch.nn.functional.mse_loss(preds, target, reduction="none")
+
+
+def normalize_with_source_model_loss(
+    loss: torch.Tensor,
+    source_model_loss: torch.Tensor,
+) -> torch.Tensor:
+    """
+    Normalize the loss with the source model loss.
+    We use the exponential of the negative source model loss as the normalization factor.
+    This is because the source model loss is the cross-entropy loss of the source model.
+    Cross-entropy loss is the log of the probability of the correct class.
+    """
+    normaliation_factor = torch.exp(-source_model_loss)
+    return loss * normaliation_factor

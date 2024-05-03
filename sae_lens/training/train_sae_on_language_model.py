@@ -144,6 +144,12 @@ def train_sae_group_on_language_model(
         # Do a training step.
         layer_acts = activation_store.next_batch()
         n_training_tokens += batch_size
+        
+        # Separate out the source model loss if we're collecting it.
+        source_model_loss = None
+        if activation_store.collect_source_model_loss:
+            source_model_loss = layer_acts[..., -1]
+            layer_acts = layer_acts[..., :-1]
 
         mse_losses: list[torch.Tensor] = []
         l1_losses: list[torch.Tensor] = []
@@ -161,6 +167,7 @@ def train_sae_group_on_language_model(
                 all_layers=all_layers,
                 batch_size=batch_size,
                 wandb_suffix=wandb_suffix,
+                source_model_loss=source_model_loss
             )
             mse_losses.append(step_output.mse_loss)
             l1_losses.append(step_output.l1_loss)
@@ -335,6 +342,9 @@ def _init_sae_group_b_decs(
         sae_layer_id = all_layers.index(sae.hook_point_layer)
         if hyperparams.b_dec_init_method == "geometric_median":
             layer_acts = activation_store.storage_buffer.detach()[:, sae_layer_id, :]
+            if hyperparams.collect_source_model_loss:
+                # remove the source model loss from the activations
+                layer_acts = layer_acts[..., :-1]
             # get geometric median of the activations if we're using those.
             if sae_layer_id not in geometric_medians:
                 median = compute_geometric_median(
@@ -381,6 +391,7 @@ def _train_step(
     all_layers: list[int],
     batch_size: int,
     wandb_suffix: str,
+    source_model_loss: torch.Tensor | None = None,
 ) -> TrainStepOutput:
     assert sparse_autoencoder.cfg.d_sae is not None  # keep pyright happy
     layer_id = all_layers.index(sparse_autoencoder.hook_point_layer)
@@ -432,6 +443,7 @@ def _train_step(
     ) = sparse_autoencoder(
         sae_in,
         ghost_grad_neuron_mask,
+        source_model_loss,
     )
     did_fire = (feature_acts > 0).float().sum(-2) > 0
     ctx.n_forward_passes_since_fired += 1
