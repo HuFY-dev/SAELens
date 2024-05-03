@@ -82,7 +82,6 @@ class SparseAutoencoder(HookedRootModule):
         self.hook_point_layer = cfg.hook_point_layer
         self.noise_scale = cfg.noise_scale
         self.activation_fn = get_activation_fn(cfg.activation_fn)
-        self.l1_normalization_fn = get_activation_fn(cfg.l1_normalization_fn)
 
         # NOTE: if using resampling neurons method, you must ensure that we initialise the weights in the order W_enc, b_enc, W_dec, b_dec
         self.W_enc = nn.Parameter(
@@ -199,10 +198,10 @@ class SparseAutoencoder(HookedRootModule):
             )
 
         mse_loss = per_item_mse_loss.mean()
-        # Normalize the L1 norm of the feature activations. Default is do nothing.
-        # See config for more info.
-        feature_acts = self.l1_normalization_fn(feature_acts)
-        sparsity = feature_acts.norm(p=self.lp_norm, dim=1).mean(dim=(0,))
+        sparsity = feature_acts.norm(p=self.lp_norm, dim=-1)
+        if self.cfg.l1_loss_normalization == "target_norm":
+            sparsity = sparsity / x.norm(dim=-1)
+        sparsity = sparsity.mean(dim=(0,))
         l1_loss = self.l1_coefficient * sparsity
         loss = mse_loss + l1_loss + ghost_grad_loss
 
@@ -480,6 +479,11 @@ def _per_item_mse_loss_with_target_norm(
     if mse_loss_normalization == "dense_batch":
         target_centered = target - target.mean(dim=0, keepdim=True)
         normalization = target_centered.norm(dim=-1, keepdim=True)
+        return torch.nn.functional.mse_loss(preds, target, reduction="none") / (
+            normalization + 1e-6
+        )
+    if mse_loss_normalization == "square_target_norm":
+        normalization = target.norm(dim=-1, keepdim=True) ** 2
         return torch.nn.functional.mse_loss(preds, target, reduction="none") / (
             normalization + 1e-6
         )
